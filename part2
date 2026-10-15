@@ -1,0 +1,507 @@
+### 8.4 Internal image registry
+
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: image-registry-storage
+  namespace: openshift-image-registry
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 200Gi
+  storageClassName: ocs-storagecluster-cephfs
+EOF
+oc patch configs.imageregistry.operator.openshift.io cluster --type merge -p \
+ '{"spec":{"managementState":"Managed","replicas":2,"rolloutStrategy":"RollingUpdate",
+   "storage":{"pvc":{"claim":"image-registry-storage"}}}}'
+oc get co image-registry
+```
+(Alternatively use an ODF/NooBaa S3 bucket via an `ObjectBucketClaim`.)
+
+### 8.5 Monitoring stack: persistence, retention, placement
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    enableUserWorkload: true
+    prometheusK8s:
+      retention: 15d
+      retentionSize: 90GiB
+      volumeClaimTemplate:
+        spec:
+          storageClassName: ocs-storagecluster-ceph-rbd
+          resources:
+            requests:
+              storage: 100Gi
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+      tolerations: &infraTol
+        - key: node-role.kubernetes.io/infra
+          value: reserved
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/infra
+          value: reserved
+          effect: NoExecute
+    alertmanagerMain:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: ocs-storagecluster-ceph-rbd
+          resources:
+            requests:
+              storage: 10Gi
+      nodeSelector:
+        node-role.kubernetes.io/infra: ""
+      tolerations: *infraTol
+    kubeStateMetrics:
+      nodeSelector: {node-role.kubernetes.io/infra: ""}
+      tolerations: *infraTol
+    telemeterClient:
+      enabled: false              # disconnected: no telemetry
+    thanosQuerier:
+      nodeSelector: {node-role.kubernetes.io/infra: ""}
+      tolerations: *infraTol
+    prometheusOperator:
+      nodeSelector: {node-role.kubernetes.io/infra: ""}
+      tolerations: *infraTol
+    openshiftStateMetrics:
+      nodeSelector: {node-role.kubernetes.io/infra: ""}
+      tolerations: *infraTol
+    monitoringPlugin:
+      nodeSelector: {node-role.kubernetes.io/infra: ""}
+      tolerations: *infraTol
+```
+
+Alertmanager receivers:
+```bash
+oc -n openshift-monitoring get secret alertmanager-main -o jsonpath='{.data.alertmanager\.yaml}' | base64 -d > alertmanager.yaml
+# edit: add email/webhook/PagerDuty receivers and routes, then:
+oc -n openshift-monitoring create secret generic alertmanager-main \
+  --from-file=alertmanager.yaml --dry-run=client -o yaml | oc replace -f -
+```
+
+### 8.6 Identity provider (LDAP/Active Directory example)
+
+```bash
+oc create secret generic ldap-bind-password --from-literal=bindPassword='<pwd>' -n openshift-config
+oc create configmap ldap-ca --from-file=ca.crt=/path/to/ad-ca.pem -n openshift-config
+```
+```yaml
+apiVersion: config.openshift.io/v1
+kind: OAuth
+metadata:
+  name: cluster
+spec:
+  tokenConfig:
+    accessTokenMaxAgeSeconds: 28800     # 8h
+    accessTokenInactivityTimeout: 2h
+  identityProviders:
+    - name: corp-ad
+      mappingMethod: claim
+      type: LDAP
+      ldap:
+        url: "ldaps://ad.example.com:636/DC=example,DC=com?sAMAccountName?sub?(objectClass=person)"
+        bindDN: "CN=ocp-bind,OU=Service Accounts,DC=example,DC=com"
+        bindPassword:
+          name: ldap-bind-password
+        ca:
+          name: ldap-ca
+        insecure: false
+        attributes:
+          id: [sAMAccountName]
+          email: [mail]
+          name: [displayName]
+          preferredUsername: [sAMAccountName]
+```
+
+Group sync (LDAPSyncConfig + CronJob) and RBAC:
+```bash
+oc adm groups sync --sync-config=ldap-sync.yaml --confirm
+oc adm policy add-cluster-role-to-group cluster-admin ocp-cluster-admins
+oc adm policy add-cluster-role-to-group cluster-reader ocp-readonly
+```
+
+Remove kubeadmin **only after** verifying a cluster-admin IdP login works:
+```bash
+oc login -u <admin-user> https://api.ocp-prod.example.com:6443
+oc delete secret kubeadmin -n kube-system
+```
+
+### 8.7 Custom TLS certificates
+
+```bash
+# Ingress (wildcard *.apps)
+oc create secret tls apps-wildcard --cert=apps-fullchain.pem --key=apps.key -n openshift-ingress
+oc patch ingresscontroller default -n openshift-ingress-operator --type merge \
+  -p '{"spec":{"defaultCertificate":{"name":"apps-wildcard"}}}'
+
+# API server
+oc create secret tls api-cert --cert=api-fullchain.pem --key=api.key -n openshift-config
+oc patch apiserver cluster --type merge -p \
+ '{"spec":{"servingCerts":{"namedCertificates":[{"names":["api.ocp-prod.example.com"],"servingCertificate":{"name":"api-cert"}}]}}}'
+
+# Enterprise CA trust for the whole cluster (outbound to LDAP, registries, etc.)
+oc create configmap corp-ca-bundle --from-file=ca-bundle.crt=corp-ca-chain.pem -n openshift-config
+oc patch proxy/cluster --type merge -p '{"spec":{"trustedCA":{"name":"corp-ca-bundle"}}}'
+```
+
+### 8.8 Project template with defaults (quotas, limits, network policy)
+
+```bash
+oc adm create-bootstrap-project-template -o yaml > project-template.yaml
+# Append the objects below under `objects:`, then:
+oc create -f project-template.yaml -n openshift-config
+oc patch project.config.openshift.io/cluster --type merge -p '{"spec":{"projectRequestTemplate":{"name":"project-request"}}}'
+```
+```yaml
+- apiVersion: v1
+  kind: LimitRange
+  metadata: {name: default-limits, namespace: "${PROJECT_NAME}"}
+  spec:
+    limits:
+      - type: Container
+        default: {cpu: 500m, memory: 512Mi}
+        defaultRequest: {cpu: 100m, memory: 128Mi}
+        max: {cpu: "4", memory: 8Gi}
+- apiVersion: v1
+  kind: ResourceQuota
+  metadata: {name: default-quota, namespace: "${PROJECT_NAME}"}
+  spec:
+    hard: {pods: "50", requests.cpu: "10", requests.memory: 20Gi, limits.cpu: "20", limits.memory: 40Gi, persistentvolumeclaims: "20"}
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: allow-same-namespace, namespace: "${PROJECT_NAME}"}
+  spec:
+    podSelector: {}
+    ingress:
+      - from: [{podSelector: {}}]
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: allow-from-openshift-ingress, namespace: "${PROJECT_NAME}"}
+  spec:
+    podSelector: {}
+    ingress:
+      - from: [{namespaceSelector: {matchLabels: {network.openshift.io/policy-group: ingress}}}]
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: allow-from-openshift-monitoring, namespace: "${PROJECT_NAME}"}
+  spec:
+    podSelector: {}
+    ingress:
+      - from: [{namespaceSelector: {matchLabels: {network.openshift.io/policy-group: monitoring}}}]
+```
+
+Restrict self-provisioning if projects must be created via a request process:
+```bash
+oc patch clusterrolebinding.rbac self-provisioners -p '{"subjects": null}'
+oc annotate clusterrolebinding.rbac self-provisioners 'rbac.authorization.kubernetes.io/autoupdate=false' --overwrite
+```
+
+### 8.9 Image policy
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: Image
+metadata:
+  name: cluster
+spec:
+  registrySources:
+    allowedRegistries:
+      - registry.example.com:8443
+      - image-registry.openshift-image-registry.svc:5000
+    insecureRegistries: []
+```
+
+---
+
+## 9. Operator Installation
+
+Install via OLM using Namespace → OperatorGroup → Subscription. All operators are sourced from the mirrored catalog (`cs-redhat-operator-index-v4-22`).
+
+**Generic pattern** (example: Compliance Operator):
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-compliance
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: compliance-operator
+  namespace: openshift-compliance
+spec:
+  targetNamespaces: [openshift-compliance]
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: compliance-operator
+  namespace: openshift-compliance
+spec:
+  channel: stable
+  name: compliance-operator
+  source: cs-redhat-operator-index-v4-22      # mirrored CatalogSource name
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Manual                # production: review upgrades
+```
+Find channel/source: `oc get packagemanifest compliance-operator -o jsonpath='{.status.defaultChannel}'`.
+Approve InstallPlans: `oc get installplan -n <ns>` → `oc patch installplan <name> -n <ns> --type merge -p '{"spec":{"approved":true}}'`.
+
+### 9.1 Operator matrix
+
+| Operator (package) | Namespace | OperatorGroup scope | Key post-install CR |
+|---|---|---|---|
+| `local-storage-operator` | openshift-local-storage | single ns | LocalVolumeSet |
+| `odf-operator` | openshift-storage | single ns | StorageCluster |
+| `cluster-logging` | openshift-logging | single ns | ClusterLogForwarder |
+| `loki-operator` | openshift-operators-redhat | all ns | LokiStack (needs S3/NooBaa bucket) |
+| `cluster-observability-operator` | openshift-cluster-observability-operator | all ns | UIPlugin (logging/troubleshooting) |
+| `compliance-operator` | openshift-compliance | single ns | ScanSettingBinding |
+| `file-integrity-operator` | openshift-file-integrity | single ns | FileIntegrity |
+| `security-profiles-operator` | openshift-security-profiles | all ns | SeccompProfile |
+| `rhacs-operator` | rhacs-operator | all ns | Central, SecuredCluster |
+| `openshift-cert-manager-operator` | cert-manager-operator | single ns | ClusterIssuer |
+| `openshift-gitops-operator` | openshift-gitops-operator | all ns | ArgoCD |
+| `openshift-pipelines-operator-rh` | openshift-operators | all ns | TektonConfig |
+| `metallb-operator` | metallb-system | single ns | MetalLB, IPAddressPool, L2Advertisement |
+| `kubernetes-nmstate-operator` | openshift-nmstate | single ns | NMState |
+| `nfd` | openshift-nfd | single ns | NodeFeatureDiscovery |
+| `node-maintenance-operator` | openshift-workload-availability | all ns | NodeMaintenance |
+| `redhat-oadp-operator` | openshift-adp | single ns | DataProtectionApplication |
+| `cincinnati-operator` | openshift-update-service | single ns | UpdateService |
+| `cluster-resource-override-operator` | clusterresourceoverride-operator | single ns | ClusterResourceOverride |
+| `advanced-cluster-management` (opt.) | open-cluster-management | single ns | MultiClusterHub |
+
+### 9.2 Logging (Loki + Vector) minimum config
+
+```yaml
+# NooBaa bucket for Loki
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata: {name: loki-bucket, namespace: openshift-logging}
+spec:
+  generateBucketName: loki
+  storageClassName: openshift-storage.noobaa.io
+```
+Create secret `logging-loki-s3` from the OBC's ConfigMap/Secret (`BUCKET_NAME`, `BUCKET_HOST`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`), then:
+```yaml
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata: {name: logging-loki, namespace: openshift-logging}
+spec:
+  size: 1x.small               # 1x.medium for larger clusters
+  storage:
+    schemas: [{version: v13, effectiveDate: "2024-10-01"}]
+    secret: {name: logging-loki-s3, type: s3}
+  storageClassName: ocs-storagecluster-ceph-rbd
+  tenants: {mode: openshift-logging}
+  template:
+    ingester: {nodeSelector: {node-role.kubernetes.io/infra: ""}, tolerations: [{key: node-role.kubernetes.io/infra, value: reserved, effect: NoSchedule},{key: node-role.kubernetes.io/infra, value: reserved, effect: NoExecute}]}
+    # repeat nodeSelector/tolerations for querier, queryFrontend, distributor, compactor, gateway, indexGateway, ruler
+---
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata: {name: collector, namespace: openshift-logging}
+spec:
+  serviceAccount: {name: collector}
+  outputs:
+    - name: default-lokistack
+      type: lokiStack
+      lokiStack: {target: {name: logging-loki, namespace: openshift-logging}, authentication: {token: {from: serviceAccount}}}
+      tls: {ca: {key: service-ca.crt, configMapName: openshift-service-ca.crt}}
+  pipelines:
+    - name: all-logs
+      inputRefs: [application, infrastructure, audit]
+      outputRefs: [default-lokistack]
+```
+Grant the `collector` SA: `collect-application-logs`, `collect-infrastructure-logs`, `collect-audit-logs` cluster roles.
+
+### 9.3 Compliance scan
+
+```yaml
+apiVersion: compliance.openshift.io/v1alpha1
+kind: ScanSettingBinding
+metadata: {name: cis-scan, namespace: openshift-compliance}
+profiles:
+  - {name: ocp4-cis, kind: Profile, apiGroup: compliance.openshift.io/v1alpha1}
+  - {name: ocp4-cis-node, kind: Profile, apiGroup: compliance.openshift.io/v1alpha1}
+settingsRef: {name: default, kind: ScanSetting, apiGroup: compliance.openshift.io/v1alpha1}
+```
+`oc get compliancecheckresults -n openshift-compliance | grep FAIL` → review and apply remediations deliberately.
+
+### 9.4 MetalLB (for LoadBalancer services)
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: MetalLB
+metadata: {name: metallb, namespace: metallb-system}
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata: {name: prod-pool, namespace: metallb-system}
+spec:
+  addresses: [192.168.100.200-192.168.100.230]
+  autoAssign: false
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata: {name: prod-l2, namespace: metallb-system}
+spec:
+  ipAddressPools: [prod-pool]
+```
+
+---
+
+## 10. Security Hardening
+
+```bash
+# etcd encryption at rest
+oc patch apiserver cluster --type merge -p '{"spec":{"encryption":{"type":"aesgcm"}}}'
+oc get openshiftapiserver -o jsonpath='{.items[0].status.conditions[?(@.type=="Encrypted")].message}'
+
+# Audit log profile
+oc patch apiserver cluster --type merge -p '{"spec":{"audit":{"profile":"WriteRequestBodies"}}}'
+
+# Restrict pod security (default is restricted-v2; confirm no privileged SCC grants)
+oc get clusterrolebinding -o json | jq -r '.items[] | select(.roleRef.name=="system:openshift:scc:privileged") | .metadata.name'
+
+# OAuth token lifetime (set in 8.6), disable self-provisioning (8.8)
+
+# Ingress TLS profile
+oc patch ingresscontroller default -n openshift-ingress-operator --type merge \
+  -p '{"spec":{"tlsSecurityProfile":{"type":"Intermediate","intermediate":{}}}}'
+oc patch apiserver cluster --type merge -p '{"spec":{"tlsSecurityProfile":{"type":"Intermediate","intermediate":{}}}}'
+
+# Default-deny network policy via project template (8.8); egress firewall per namespace as needed
+```
+
+Also: enable **File Integrity Operator** on all MCPs; deploy **RHACS** SecuredCluster with admission control in enforce mode after a baseline period; store secrets in Vault/External Secrets rather than in Git.
+
+---
+
+## 11. Backup, Updates and DR
+
+### 11.1 etcd backup (CronJob on a control-plane node)
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: etcd-backup, namespace: openshift-etcd}
+spec:
+  schedule: "0 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector: {node-role.kubernetes.io/master: ""}
+          tolerations: [{key: node-role.kubernetes.io/master, effect: NoSchedule}]
+          hostNetwork: true
+          hostPID: true
+          serviceAccountName: etcd-backup
+          restartPolicy: Never
+          containers:
+            - name: backup
+              image: registry.example.com:8443/openshift4/ose-tools-rhel9:latest
+              securityContext: {privileged: true}
+              command: ["/bin/bash","-c"]
+              args:
+                - chroot /host /usr/local/bin/cluster-backup.sh /home/core/backup/$(date +%F-%H%M) &&
+                  find /host/home/core/backup -mtime +7 -delete
+              volumeMounts: [{name: host, mountPath: /host}]
+          volumes: [{name: host, hostPath: {path: /}}]
+```
+Grant the SA `privileged` SCC. **Sync backups off-node** (rsync/NFS/S3) and **test a restore** on a staging cluster.
+
+### 11.2 Application backup — OADP
+
+```yaml
+apiVersion: oadp.openshift.io/v1alpha1
+kind: DataProtectionApplication
+metadata: {name: dpa, namespace: openshift-adp}
+spec:
+  configuration:
+    velero: {defaultPlugins: [openshift, aws, csi]}
+    nodeAgent: {enable: true, uploaderType: kopia}
+  backupLocations:
+    - velero:
+        provider: aws
+        default: true
+        objectStorage: {bucket: oadp-backups, prefix: ocp-prod}
+        config: {region: noobaa, s3ForcePathStyle: "true", s3Url: https://s3.openshift-storage.svc}
+        credential: {name: cloud-credentials, key: cloud}
+```
+Schedule: `velero schedule create daily --schedule="0 2 * * *" --include-namespaces '*' --ttl 720h`.
+
+### 11.3 Cluster updates (disconnected)
+
+1. Mirror the target release with oc-mirror (update `maxVersion` in ImageSetConfiguration) and push to the registry.
+2. Apply new `signature-configmap.yaml` and updated IDMS.
+3. OSUS graph refreshes automatically; `oc adm upgrade` lists the target.
+4. Pre-checks: `oc get co`, `oc get mcp`, `oc adm upgrade`, no `PodDisruptionBudget` blocking drains, etcd backup taken.
+5. Pause worker MCPs for staged rollout (EUS-to-EUS): `oc patch mcp worker -p '{"spec":{"paused":true}}' --type merge`.
+6. `oc adm upgrade --to=4.22.17` (control plane first), unpause pools, monitor `oc get mcp -w`.
+7. Always test the exact path in a non-prod cluster first.
+
+### 11.4 DR runbook (document and rehearse)
+
+- Control-plane node replacement (`oc adm cordon/drain`, re-boot with agent ISO is **not** supported for day-2 — use BMH/MachineSet or the `oc adm node-image create` flow for adding nodes).
+- Full etcd restore: `cluster-restore.sh` procedure.
+- Certificate expiry recovery (CSR approval after prolonged shutdown).
+- Loss of mirror registry: Quay backup (`/opt/quay/storage`, postgres dump).
+
+---
+
+## 12. Validation & Go-Live Checklist
+
+| # | Check | Command / Evidence | ✓ |
+|---|---|---|---|
+| 1 | All cluster operators healthy for 24h | `oc get co` | ☐ |
+| 2 | Nodes Ready, correct roles/taints | `oc get nodes -o wide` | ☐ |
+| 3 | MCPs Updated, not Degraded | `oc get mcp` | ☐ |
+| 4 | Default OperatorHub sources disabled; mirrored catalog READY | `oc get catalogsource -n openshift-marketplace` | ☐ |
+| 5 | IDMS/ITMS applied; test pull from a sample image | `oc debug node/<n> -- chroot /host podman pull ...` | ☐ |
+| 6 | ODF healthy, default StorageClass set | `oc get cephcluster -n openshift-storage` | ☐ |
+| 7 | Image registry Managed with PVC | `oc get co image-registry` | ☐ |
+| 8 | Monitoring on PVs, telemetry disabled, alerts routed & test-fired | `amtool` / receive test alert | ☐ |
+| 9 | Logging flowing to Loki; query in console | Observe → Logs | ☐ |
+| 10 | IdP login works; kubeadmin removed | `oc get secret kubeadmin -n kube-system` → NotFound | ☐ |
+| 11 | Custom certs on API & ingress | `openssl s_client -connect api...:6443` | ☐ |
+| 12 | etcd encrypted; backup CronJob ran; restore tested in staging | `oc get cronjob -n openshift-etcd` | ☐ |
+| 13 | Compliance scan run; critical findings remediated/accepted | `oc get compliancesuite` | ☐ |
+| 14 | Project template enforces quota/limits/netpol | create test project | ☐ |
+| 15 | OSUS graph available; upgrade path visible | `oc adm upgrade` | ☐ |
+| 16 | OADP backup & restore of a sample app succeeded | `velero backup get` | ☐ |
+| 17 | LB health checks green; failover tested | LB console | ☐ |
+| 18 | Chaos test: reboot one master, one infra, one worker — no outage | — | ☐ |
+| 19 | Runbooks and access procedures documented | Wiki/Git | ☐ |
+| 20 | `must-gather` collected and archived as baseline | `oc adm must-gather` | ☐ |
+
+---
+
+## 13. Troubleshooting Reference
+
+| Symptom | Where to look |
+|---|---|
+| Agent ISO boots but node not discovered | `ssh core@<node>` → `journalctl -u agent -f`; check DNS/NTP/MAC in agent-config |
+| Rendezvous host stuck "waiting for hosts" | Other nodes' NTP skew, wrong MAC, duplicate IP, LB health check on 6443 |
+| `ImagePullBackOff` on `quay.io/...` | IDMS not applied / registry CA not trusted → `oc get idms`, check `/etc/containers/registries.conf` on node |
+| CatalogSource not READY | `oc -n openshift-marketplace logs <catalog-pod>`; image path mismatch with mirror |
+| MCP Degraded after config | `oc describe mcp <pool>`; `oc get mcp -o yaml | grep -A5 conditions`; node `journalctl -u machine-config-daemon` |
+| etcd slow / leader elections | `oc -n openshift-etcd exec -it <etcd-pod> -- etcdctl endpoint status -w table`; disk fsync metrics in Prometheus |
+| CSRs pending after node add/reboot | `oc get csr -o name | xargs oc adm certificate approve` |
+| Ingress route 503 | Router pods on infra nodes? `oc get pods -n openshift-ingress -o wide`; LB backend health |
+| Collect diagnostics | `oc adm must-gather --image=registry.example.com:8443/openshift4/ose-must-gather:latest` |
+
+---
+
+*Document version 1.0 — maintain in Git alongside the GitOps repository and update on every cluster change.*
