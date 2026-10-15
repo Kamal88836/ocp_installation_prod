@@ -1,0 +1,485 @@
+## 7. Nodes
+
+### 7.1 Node Feature Discovery (NFD)
+
+| | |
+|---|---|
+| **Purpose** | Detects hardware features (CPU flags, PCI devices such as GPUs/NICs, kernel version, NUMA, SR-IOV capability) and labels nodes with `feature.node.kubernetes.io/*`. Prerequisite for GPU Operator, SR-IOV, and KMM; enables `nodeAffinity` scheduling on hardware. |
+| **Package** | `nfd` |
+| **Namespace / scope** | `openshift-nfd` / single namespace |
+| **Channel** | `stable` |
+| **Primary CR** | `NodeFeatureDiscovery`, `NodeFeatureRule` |
+
+```yaml
+apiVersion: nfd.openshift.io/v1
+kind: NodeFeatureDiscovery
+metadata: {name: nfd-instance, namespace: openshift-nfd}
+spec:
+  operand:
+    image: registry.example.com:8443/openshift4/ose-node-feature-discovery-rhel9:v4.22   # mirrored path
+    imagePullPolicy: IfNotPresent
+    servicePort: 12000
+  workerConfig:
+    configData: |
+      core:
+        sleepInterval: 60s
+      sources:
+        pci:
+          deviceClassWhitelist: ["0200", "0300", "0302"]     # NICs, GPUs
+          deviceLabelFields: [vendor, device]
+        custom:
+          - name: "network-sriov.capable"
+            matchOn: [{pciId: {vendor: ["8086"], device: ["1593","158b"]}}]
+```
+Verify: `oc get node <n> --show-labels | tr ',' '\n' | grep feature.node`.
+
+### 7.2 Node Maintenance Operator (NMO)
+
+| | |
+|---|---|
+| **Purpose** | Puts a node into maintenance with a single CR: cordons, drains (respecting PDBs), and — with OpenShift Virtualization — live-migrates VMs. Reports drain progress and blocking pods. Safer and auditable compared with ad-hoc `oc adm drain`. |
+| **Package** | `node-maintenance-operator` |
+| **Namespace / scope** | `openshift-workload-availability` / all namespaces |
+| **Channel** | `stable` |
+| **Primary CR** | `NodeMaintenance` |
+
+```yaml
+apiVersion: nodemaintenance.medik8s.io/v1beta1
+kind: NodeMaintenance
+metadata: {name: worker-1-firmware}
+spec:
+  nodeName: worker-1
+  reason: "BIOS/firmware update CHG0012345"
+```
+```bash
+oc get nodemaintenance worker-1-firmware -o jsonpath='{.status.phase} {.status.pendingPods}'
+# do the hardware work, then:
+oc delete nodemaintenance worker-1-firmware   # uncordons
+```
+Production notes: pair with **Node Health Check** + **Self Node Remediation** operators (same `medik8s` family) if you want automated fencing of unresponsive bare-metal nodes.
+
+### 7.3 Kernel Module Management (KMM)
+
+| | |
+|---|---|
+| **Purpose** | Builds, signs (Secure Boot), and loads out-of-tree kernel modules on RHCOS nodes via a `Module` CR, with a DaemonSet per kernel version and automatic rebuild on cluster upgrades. Required for vendor drivers (NVIDIA pre-GPU-Operator, Intel QAT, FPGA, specialised NICs/HBAs). |
+| **Package** | `kernel-module-management` (+ `kernel-module-management-hub` for ACM hub builds) |
+| **Namespace / scope** | `openshift-kmm` / all namespaces |
+| **Channel** | `stable` |
+| **Primary CRs** | `Module`, `PreflightValidationOCP` |
+
+```yaml
+apiVersion: kmm.sigs.x-k8s.io/v1beta1
+kind: Module
+metadata: {name: vendor-nic, namespace: openshift-kmm}
+spec:
+  moduleLoader:
+    container:
+      modprobe: {moduleName: vendor_nic}
+      kernelMappings:
+        - regexp: '^.*\.x86_64$'
+          containerImage: registry.example.com:8443/drivers/vendor-nic:${KERNEL_FULL_VERSION}
+          build:
+            dockerfileConfigMap: {name: vendor-nic-dockerfile}
+          sign:
+            keySecret: {name: secureboot-key}
+            certSecret: {name: secureboot-cert}
+            filesToSign: [/opt/lib/modules/${KERNEL_FULL_VERSION}/vendor_nic.ko]
+  imageRepoSecret: {name: mirror-registry-pull}
+  selector: {feature.node.kubernetes.io/pci-1234.present: "true"}
+```
+Production notes: run `PreflightValidationOCP` against the target kernel **before** every cluster upgrade; disconnected builds need the DTK (driver toolkit) image mirrored (`additionalImages: registry.redhat.io/openshift4/driver-toolkit-rhel9`).
+
+---
+
+## 8. Multi-cluster — Red Hat Advanced Cluster Management (RHACM)
+
+| | |
+|---|---|
+| **Purpose** | Hub for a fleet of clusters: lifecycle (create/import/upgrade clusters, incl. bare metal via Assisted Installer), **Governance** (policy-as-code enforcing operators, configs, and compliance across clusters), application placement (GitOps/ApplicationSets across clusters), **Observability** (Thanos-based long-term metrics across clusters), and **DR** (Regional-DR / Metro-DR with ODF). Install on a dedicated hub cluster, not the production workload cluster. |
+| **Packages** | `advanced-cluster-management` (pulls `multicluster-engine`) |
+| **Namespace / scope** | `open-cluster-management` / single namespace |
+| **Channel** | `release-2.16` (check `defaultChannel`) |
+| **Primary CRs** | `MultiClusterHub`, `ManagedCluster`, `Policy`, `PlacementBinding`, `MultiClusterObservability` |
+
+```yaml
+apiVersion: operator.open-cluster-management.io/v1
+kind: MultiClusterHub
+metadata: {name: multiclusterhub, namespace: open-cluster-management}
+spec:
+  availabilityConfig: High
+  disableHubSelfManagement: false
+  nodeSelector: {node-role.kubernetes.io/infra: ""}
+  tolerations:
+    - {key: node-role.kubernetes.io/infra, value: reserved, effect: NoSchedule}
+    - {key: node-role.kubernetes.io/infra, value: reserved, effect: NoExecute}
+  overrides:
+    components:
+      - {name: cluster-backup, enabled: true}       # OADP-based hub backup
+      - {name: search, enabled: true}
+---
+# Example governance policy: require Compliance Operator on all prod clusters
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata: {name: policy-compliance-operator, namespace: rhacm-policies}
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata: {name: compliance-operator-sub}
+        spec:
+          remediationAction: enforce
+          severity: high
+          object-templates:
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: operators.coreos.com/v1alpha1
+                kind: Subscription
+                metadata: {name: compliance-operator, namespace: openshift-compliance}
+                spec: {name: compliance-operator, channel: stable, source: cs-redhat-operator-index-v4-22, sourceNamespace: openshift-marketplace}
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata: {name: prod-clusters, namespace: rhacm-policies}
+spec:
+  predicates: [{requiredClusterSelector: {labelSelector: {matchLabels: {environment: prod}}}}]
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata: {name: bind-compliance, namespace: rhacm-policies}
+placementRef: {name: prod-clusters, kind: Placement, apiGroup: cluster.open-cluster-management.io}
+subjects: [{name: policy-compliance-operator, kind: Policy, apiGroup: policy.open-cluster-management.io}]
+```
+Import an existing cluster: console → Infrastructure → Clusters → Import, or `oc apply` the generated `ManagedCluster` + klusterlet manifests on the spoke.
+Production notes: hub sizing ≈ 3 × 8 vCPU/32 GB infra just for ACM + Observability; disconnected hubs need the `multicluster-engine` and assisted-service images mirrored; use the Policy Generator Kustomize plugin from the open-cluster-management/policy-collection repo for policy-as-code.
+
+---
+
+## 9. Backup — OADP (OpenShift API for Data Protection)
+
+| | |
+|---|---|
+| **Purpose** | Red Hat's supported **Velero** distribution: backs up namespaces (all API objects incl. OpenShift-specific ones like Routes, ImageStreams, DeploymentConfigs) and persistent volumes via CSI snapshots or file-system copy (Kopia) to S3. Supports scheduled backups, restores to the same or a different cluster, and is the engine behind ACM hub backup and Virtualization VM backups. **Does not back up etcd** — use `cluster-backup.sh` for that. |
+| **Package** | `redhat-oadp-operator` |
+| **Namespace / scope** | `openshift-adp` / single namespace |
+| **Channel** | `stable-1.5` |
+| **Primary CRs** | `DataProtectionApplication`, `Backup`, `Schedule`, `Restore`, `BackupStorageLocation` |
+
+```bash
+# S3 credentials (NooBaa OBC or external S3)
+cat > credentials-velero <<EOF
+[default]
+aws_access_key_id=<key>
+aws_secret_access_key=<secret>
+EOF
+oc create secret generic cloud-credentials -n openshift-adp --from-file cloud=credentials-velero
+```
+```yaml
+apiVersion: oadp.openshift.io/v1alpha1
+kind: DataProtectionApplication
+metadata: {name: dpa, namespace: openshift-adp}
+spec:
+  configuration:
+    velero:
+      defaultPlugins: [openshift, aws, csi, kubevirt]
+      defaultSnapshotMoveData: true          # Data Mover: copy CSI snapshots to S3
+      resourceTimeout: 10m
+      podConfig: {resourceAllocations: {requests: {cpu: 500m, memory: 512Mi}}}
+    nodeAgent:
+      enable: true
+      uploaderType: kopia
+      podConfig: {resourceAllocations: {requests: {cpu: 500m, memory: 1Gi}}}
+  backupLocations:
+    - name: default
+      velero:
+        provider: aws
+        default: true
+        objectStorage: {bucket: oadp-backups, prefix: ocp-prod}
+        config:
+          region: noobaa
+          s3ForcePathStyle: "true"
+          s3Url: https://s3.openshift-storage.svc:443
+          insecureSkipTLSVerify: "false"
+        credential: {name: cloud-credentials, key: cloud}
+        caCert: <base64 service CA>
+  snapshotLocations: []
+```
+```yaml
+# Mark the ODF snapshot class for Velero
+# oc label volumesnapshotclass ocs-storagecluster-rbdplugin-snapclass velero.io/csi-volumesnapshot-class="true"
+apiVersion: velero.io/v1
+kind: Schedule
+metadata: {name: daily-apps, namespace: openshift-adp}
+spec:
+  schedule: "0 2 * * *"
+  useOwnerReferencesInBackup: false
+  template:
+    includedNamespaces: ["*"]
+    excludedNamespaces: [openshift-*, kube-*, default, openshift-adp]
+    snapshotMoveData: true
+    ttl: 720h
+    storageLocation: default
+```
+Operate: `oc get backup -n openshift-adp`, `velero backup describe <name> --details`, restore with `velero restore create --from-backup <name> --include-namespaces app-team-a`.
+Production notes: replicate the backup bucket to a second site (NooBaa bucket replication or external S3); test a cross-cluster restore quarterly; exclude secrets that are re-synced by ESO.
+
+---
+
+## 10. Service Mesh, Serverless, Virtualization (install only if required)
+
+### 10.1 OpenShift Service Mesh 3 (Istio)
+
+| | |
+|---|---|
+| **Purpose** | Istio-based mesh: automatic **mTLS** between services, fine-grained L7 authorization, traffic shaping (canary, retries, circuit breaking), and telemetry via Kiali (visualization) and Tempo (tracing). OSSM 3 uses the upstream Sail operator model (`Istio`, `IstioCNI` CRs) and ambient/sidecar modes. |
+| **Packages** | `servicemeshoperator3`; `kiali-ossm`; plus `tempo-product` and `opentelemetry-product` for tracing |
+| **Namespace / scope** | `openshift-operators` / all namespaces (control plane in `istio-system`, CNI in `istio-cni`) |
+| **Channel** | `stable` |
+| **Primary CRs** | `Istio`, `IstioCNI`, `IstioRevision`, `Kiali`, `PeerAuthentication`, `AuthorizationPolicy`, `Gateway` |
+
+```yaml
+apiVersion: sailoperator.io/v1
+kind: Istio
+metadata: {name: default}
+spec:
+  namespace: istio-system
+  version: v1.26.4                         # match the operator's supported version
+  updateStrategy: {type: RevisionBased, inactiveRevisionDeletionGracePeriodSeconds: 30}
+  values:
+    meshConfig:
+      accessLogFile: /dev/stdout
+      defaultConfig: {holdApplicationUntilProxyStarts: true}
+      extensionProviders:
+        - name: otel-tracing
+          opentelemetry: {service: otel-collector.openshift-tracing.svc, port: 4317}
+    pilot: {autoscaleEnabled: true, autoscaleMin: 2}
+---
+apiVersion: sailoperator.io/v1
+kind: IstioCNI
+metadata: {name: default}
+spec: {namespace: istio-cni, version: v1.26.4}
+---
+# Mesh-wide strict mTLS
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata: {name: default, namespace: istio-system}
+spec: {mtls: {mode: STRICT}}
+```
+Add workloads: label namespace `istio-injection=enabled` (sidecar) or `istio.io/dataplane-mode=ambient`.
+Production notes: significant CPU/memory overhead per pod in sidecar mode; introduce in `PERMISSIVE` mTLS and move to `STRICT` once all callers are in the mesh; the OpenShift router can front Istio ingress gateways with passthrough routes.
+
+### 10.2 OpenShift Serverless (Knative)
+
+| | |
+|---|---|
+| **Purpose** | **Knative Serving** — scale-to-zero HTTP services with revision-based traffic splitting; **Knative Eventing** — event-driven architecture with Brokers/Triggers, Kafka source/sink, and CloudEvents; **Functions** — build/deploy functions via `kn func`. Use for bursty or event-driven workloads; otherwise skip. |
+| **Package** | `serverless-operator` |
+| **Namespace / scope** | `openshift-serverless` / all namespaces |
+| **Channel** | `stable` |
+| **Primary CRs** | `KnativeServing` (ns `knative-serving`), `KnativeEventing` (ns `knative-eventing`), `KnativeKafka` |
+
+```yaml
+apiVersion: operator.knative.dev/v1beta1
+kind: KnativeServing
+metadata: {name: knative-serving, namespace: knative-serving}
+spec:
+  high-availability: {replicas: 2}
+  ingress: {kourier: {enabled: true}}        # or istio: {enabled: true} with OSSM
+  config:
+    autoscaler: {enable-scale-to-zero: "true", scale-to-zero-grace-period: 30s, stable-window: 60s}
+    defaults: {max-revision-timeout-seconds: "600", revision-timeout-seconds: "300"}
+    deployment: {registries-skipping-tag-resolving: "registry.example.com:8443"}   # disconnected
+    network: {domain-template: "{{.Name}}-{{.Namespace}}.{{.Domain}}", autocreate-cluster-domain-claims: "true"}
+---
+apiVersion: operator.knative.dev/v1beta1
+kind: KnativeEventing
+metadata: {name: knative-eventing, namespace: knative-eventing}
+spec:
+  high-availability: {replicas: 2}
+  config:
+    default-br-config: {clusterDefault: {brokerClass: Kafka, apiVersion: v1, kind: ConfigMap, name: kafka-broker-config, namespace: knative-eventing}}
+```
+Production notes: mirror the Knative component images (`registry.redhat.io/openshift-serverless-1/*`); Kafka-backed brokers need AMQ Streams (`amq-streams` operator); set `min-scale` annotations on latency-sensitive services.
+
+### 10.3 OpenShift Virtualization (KubeVirt)
+
+| | |
+|---|---|
+| **Purpose** | Runs KVM virtual machines as Kubernetes resources alongside containers: `VirtualMachine` CRs, live migration, VM templates, snapshots, hot-plug disks/NICs, and migration tooling (MTV) for importing from VMware/RHV/OVA. Requires bare metal (nested virt unsupported) with VT-x/AMD-V enabled and RWX storage (ODF RBD) for live migration. |
+| **Package** | `kubevirt-hyperconverged` (+ `mtv-operator` for migrations) |
+| **Namespace / scope** | `openshift-cnv` / single namespace |
+| **Channel** | `stable` |
+| **Primary CRs** | `HyperConverged`, `VirtualMachine`, `DataVolume`, `MigrationPolicy` |
+
+```yaml
+apiVersion: hco.kubevirt.io/v1beta1
+kind: HyperConverged
+metadata: {name: kubevirt-hyperconverged, namespace: openshift-cnv}
+spec:
+  infra:
+    nodePlacement:
+      nodeSelector: {node-role.kubernetes.io/infra: ""}
+      tolerations:
+        - {key: node-role.kubernetes.io/infra, value: reserved, effect: NoSchedule}
+        - {key: node-role.kubernetes.io/infra, value: reserved, effect: NoExecute}
+  workloads:
+    nodePlacement:
+      nodeSelector: {node-role.kubernetes.io/virt: ""}       # dedicated VM nodes
+  liveMigrationConfig:
+    parallelMigrationsPerCluster: 5
+    parallelOutboundMigrationsPerNode: 2
+    bandwidthPerMigration: 64Mi
+    completionTimeoutPerGiB: 800
+    progressTimeout: 150
+  featureGates:
+    enableCommonBootImageImport: false        # disconnected: upload boot sources manually
+    deployKubeSecondaryDNS: false
+  evictionStrategy: LiveMigrate
+  certConfig: {ca: {duration: 48h0m0s, renewBefore: 24h0m0s}, server: {duration: 24h0m0s, renewBefore: 12h0m0s}}
+  resourceRequirements:
+    vmiCPUAllocationRatio: 4                  # overcommit ratio
+```
+Verify: `oc get hco -n openshift-cnv kubevirt-hyperconverged -o jsonpath='{.status.conditions}'`, `oc get nodes -l kubevirt.io/schedulable=true`.
+Production notes: license Virtualization separately (core-based); VM networking usually needs NMState bridges (Section 6.2) + Multus NADs; use the Performance Profile for latency-sensitive VMs; the OpenShift Virtualization Engine SKU exists for VM-only clusters.
+
+---
+
+## 11. Platform Services
+
+### 11.1 OpenShift Update Service (OSUS / Cincinnati)
+
+| | |
+|---|---|
+| **Purpose** | Hosts the **update graph** locally so a disconnected cluster's Cluster Version Operator can see available upgrade paths and recommended/conditional edges exactly as a connected cluster does via `api.openshift.com`. Without it you must use `--to-image` with digests and lose edge validation. |
+| **Package** | `cincinnati-operator` |
+| **Namespace / scope** | `openshift-update-service` / single namespace |
+| **Channel** | `v1` |
+| **Primary CR** | `UpdateService` |
+
+```yaml
+# Trust the mirror registry CA for the graph builder
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: trusted-ca, namespace: openshift-config}
+data:
+  updateservice-registry: |
+    -----BEGIN CERTIFICATE-----
+    <mirror registry root CA>
+    -----END CERTIFICATE-----
+---
+# oc patch image.config.openshift.io/cluster --type merge -p '{"spec":{"additionalTrustedCA":{"name":"trusted-ca"}}}'
+apiVersion: updateservice.operator.openshift.io/v1
+kind: UpdateService
+metadata: {name: update-service, namespace: openshift-update-service}
+spec:
+  replicas: 2
+  releases: registry.example.com:8443/openshift/release-images     # from oc-mirror IDMS
+  graphDataImage: registry.example.com:8443/openshift/graph-image:latest   # built by oc-mirror when graph: true
+```
+```bash
+POLICY_ENGINE_GRAPH_URI="$(oc get updateservice update-service -n openshift-update-service -o jsonpath='{.status.policyEngineURI}/api/upgrades_info/v1/graph')"
+oc patch clusterversion version --type merge -p "{\"spec\":{\"upstream\":\"${POLICY_ENGINE_GRAPH_URI}\",\"channel\":\"eus-4.22\"}}"
+oc adm upgrade
+```
+Production notes: re-run oc-mirror with the new `maxVersion` before each upgrade; the graph-data image must be rebuilt/re-pushed too (oc-mirror does this when `graph: true`).
+
+### 11.2 Cluster Resource Override Operator
+
+| | |
+|---|---|
+| **Purpose** | Mutating admission webhook that **overrides container resource requests/limits** per namespace: e.g., force CPU requests to 25% of limits so dev/test namespaces overcommit predictably, or enforce a limit-to-request ratio. Prevents developers from requesting far more than they use and lets you pack non-production workloads densely. Does not replace LimitRange/ResourceQuota — it complements them. |
+| **Package** | `clusterresourceoverride-operator` |
+| **Namespace / scope** | `clusterresourceoverride-operator` / single namespace |
+| **Channel** | `stable` |
+| **Primary CR** | `ClusterResourceOverride` (singleton `cluster`) |
+
+```yaml
+apiVersion: operator.autoscaling.openshift.io/v1
+kind: ClusterResourceOverride
+metadata: {name: cluster}
+spec:
+  podResourceOverride:
+    spec:
+      memoryRequestToLimitPercent: 50      # request = 50% of memory limit
+      cpuRequestToLimitPercent: 25         # request = 25% of CPU limit
+      limitCPUToMemoryPercent: 200         # 200% → 2 cores per 1 GiB memory limit
+```
+Enable per namespace: `oc label ns dev-team-a clusterresourceoverrides.admission.autoscaling.openshift.io/enabled=true`.
+Production notes: apply only to non-production namespaces; the override runs after LimitRange defaults are applied, so set LimitRange defaults first.
+
+### 11.3 Node Tuning Operator (built-in) & Performance Profile
+
+| | |
+|---|---|
+| **Purpose** | NTO ships with OCP and manages **TuneD** profiles on all nodes. The **Performance Profile** API (formerly the separate Performance Addon Operator, now merged into NTO since 4.11) configures a node pool for low-latency: reserved vs isolated CPUs, huge pages, real-time kernel, topology manager, NUMA alignment, and IRQ affinity. Required for telco (DU/CU), HFT, HPC, and latency-sensitive VMs. |
+| **Package** | none — built in (`openshift-cluster-node-tuning-operator`) |
+| **Primary CRs** | `Tuned`, `PerformanceProfile` |
+
+```yaml
+# Custom TuneD profile for database workers
+apiVersion: tuned.openshift.io/v1
+kind: Tuned
+metadata: {name: db-workers, namespace: openshift-cluster-node-tuning-operator}
+spec:
+  profile:
+    - name: db-workers
+      data: |
+        [main]
+        summary=DB tuning
+        include=openshift-node
+        [sysctl]
+        vm.swappiness=1
+        vm.dirty_ratio=15
+        net.core.somaxconn=4096
+        [vm]
+        transparent_hugepages=never
+  recommend:
+    - match: [{label: node-role.kubernetes.io/db}]
+      priority: 20
+      profile: db-workers
+---
+# Low-latency node pool
+apiVersion: performance.openshift.io/v2
+kind: PerformanceProfile
+metadata: {name: low-latency}
+spec:
+  cpu:
+    reserved: "0-3,32-35"                 # housekeeping (kubelet, OVS, systemd)
+    isolated: "4-31,36-63"                # workloads
+  hugepages:
+    defaultHugepagesSize: 1G
+    pages: [{size: 1G, count: 32, node: 0}]
+  realTimeKernel: {enabled: false}        # true only with RT subscription + validated apps
+  numa: {topologyPolicy: single-numa-node}
+  nodeSelector: {node-role.kubernetes.io/worker-ll: ""}
+  machineConfigPoolSelector: {pools.operator.machineconfiguration.openshift.io/worker-ll: ""}
+  globallyDisableIrqLoadBalancing: true
+  workloadHints: {highPowerConsumption: true, realTime: true, perPodPowerManagement: false}
+```
+Create the matching `MachineConfigPool` `worker-ll` first; applying the profile reboots those nodes. Pods opt in with `Guaranteed` QoS (requests == limits, integer CPUs) and annotation `cpu-load-balancing.crio.io: "disable"`.
+Production notes: generate CPU layout with `podman run ... performance-profile-creator` against a `must-gather`; never apply a PerformanceProfile to the control plane or ODF nodes.
+
+---
+
+## 12. Installation order (recommended)
+
+| Step | Operator(s) | Reason |
+|---|---|---|
+| 1 | LSO → ODF | Everything else needs a StorageClass and S3 |
+| 2 | OSUS | Establish upgrade path before further changes |
+| 3 | COO, Loki, Logging | Capture logs during the rest of the build |
+| 4 | cert-manager, External Secrets | Certificates/secrets for subsequent operators |
+| 5 | GitOps | Put every CR below under Git control from here on |
+| 6 | Compliance, File Integrity, SPO | Baseline scan before workloads arrive |
+| 7 | RHACS | Scan mirrored images; admission in audit mode |
+| 8 | OADP | Backup before onboarding tenants |
+| 9 | MetalLB, NMState (SR-IOV if needed) | Workload networking |
+| 10 | NFD, NMO, KMM | Hardware enablement, ops |
+| 11 | Pipelines, Tempo/OTel, Service Mesh, Serverless, Virtualization | Only when a tenant requires them |
+| 12 | Cluster Resource Override | After LimitRange defaults exist |
+| 13 | ACM (hub cluster) | Import this cluster once stable |
+
+Pin every Subscription to a specific channel with `installPlanApproval: Manual`, commit all YAML to the cluster-config Git repository, and let Argo CD apply it.
