@@ -1,0 +1,839 @@
+# OpenShift 4.22 — Production Operator Reference
+## Purpose, Installation and Base Configuration for Each Operator
+
+Companion to *OCP BareMetal Disconnected Install Guide*. All operators are installed through OLM from the mirrored catalog `cs-redhat-operator-index-v4-22` (namespace `openshift-marketplace`). Replace with `redhat-operators` on a connected cluster.
+
+---
+
+## 0. Common installation pattern
+
+Every operator below is installed with the same three objects. Only the values in the per-operator table change.
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: <NAMESPACE>
+  labels:
+    openshift.io/cluster-monitoring: "true"     # lets platform Prometheus scrape it
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: <NAME>
+  namespace: <NAMESPACE>
+spec:
+  targetNamespaces:                              # OMIT this block for "AllNamespaces" scope
+    - <NAMESPACE>
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: <PACKAGE>
+  namespace: <NAMESPACE>
+spec:
+  name: <PACKAGE>
+  channel: <CHANNEL>
+  source: cs-redhat-operator-index-v4-22
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Manual                     # production default
+```
+
+Workflow:
+```bash
+oc apply -f <operator>.yaml
+oc get installplan -n <NAMESPACE>                                   # Manual approval
+oc patch installplan <ip-name> -n <NAMESPACE> --type merge -p '{"spec":{"approved":true}}'
+oc get csv -n <NAMESPACE> -w                                        # wait for Succeeded
+# discover channel:
+oc get packagemanifest <PACKAGE> -n openshift-marketplace -o jsonpath='{.status.defaultChannel}'
+```
+
+Scope rule: **Single namespace** operators (OperatorGroup with `targetNamespaces`) manage CRs only in their own namespace. **All namespaces** operators (no `targetNamespaces`) watch the whole cluster. Use the scope listed for each operator — using the wrong one causes `OperatorGroup`/`InstallMode` errors.
+
+Infra placement: operators that run heavy workloads (ODF, Loki, Prometheus, Tempo) take `nodeSelector`/`tolerations` in their primary CR so they land on infra nodes:
+```yaml
+nodeSelector:
+  node-role.kubernetes.io/infra: ""
+tolerations:
+  - {key: node-role.kubernetes.io/infra, value: reserved, effect: NoSchedule}
+  - {key: node-role.kubernetes.io/infra, value: reserved, effect: NoExecute}
+```
+
+---
+
+## 1. Storage
+
+### 1.1 Local Storage Operator (LSO)
+
+| | |
+|---|---|
+| **Purpose** | Discovers local disks on nodes and exposes them as PersistentVolumes (block or filesystem). On bare metal it is the layer ODF consumes for its OSDs. Also useful for databases that need local NVMe. |
+| **Package** | `local-storage-operator` |
+| **Namespace / scope** | `openshift-local-storage` / single namespace |
+| **Channel** | `stable` |
+| **Primary CRs** | `LocalVolumeDiscovery`, `LocalVolumeSet`, `LocalVolume` |
+
+Configuration:
+```yaml
+# Discover disks on storage nodes (optional but useful)
+apiVersion: local.storage.openshift.io/v1alpha1
+kind: LocalVolumeDiscovery
+metadata: {name: auto-discover-devices, namespace: openshift-local-storage}
+spec:
+  nodeSelector:
+    nodeSelectorTerms:
+      - matchExpressions:
+          - {key: cluster.ocs.openshift.io/openshift-storage, operator: In, values: [""]}
+---
+# Auto-claim matching disks as block PVs
+apiVersion: local.storage.openshift.io/v1alpha1
+kind: LocalVolumeSet
+metadata: {name: odf-disks, namespace: openshift-local-storage}
+spec:
+  nodeSelector:
+    nodeSelectorTerms:
+      - matchExpressions:
+          - {key: cluster.ocs.openshift.io/openshift-storage, operator: In, values: [""]}
+  storageClassName: localblock
+  volumeMode: Block
+  fstype: ""
+  maxDeviceCount: 4
+  deviceInclusionSpec:
+    deviceTypes: [disk]
+    deviceMechanicalProperties: [NonRotational]
+    minSize: 500Gi
+  tolerations:
+    - {key: node-role.kubernetes.io/infra, value: reserved, effect: NoSchedule}
+    - {key: node-role.kubernetes.io/infra, value: reserved, effect: NoExecute}
+```
+Verify: `oc get localvolumediscoveryresults -n openshift-local-storage -o yaml`, `oc get pv | grep localblock`.
+Production notes: use `deviceInclusionSpec` filters so OS disks are never claimed; label storage nodes before applying; disks must be raw (no partitions/filesystems).
+
+### 1.2 OpenShift Data Foundation (ODF)
+
+| | |
+|---|---|
+| **Purpose** | Software-defined storage (Ceph + NooBaa) delivering RBD block (RWO), CephFS (RWX) and S3 object storage inside the cluster. Required by the internal registry, Loki, OADP, Quay, etc. in disconnected environments with no external storage array. |
+| **Packages** | `odf-operator` (pulls `ocs-operator`, `mcg-operator`, `odf-csi-addons-operator`, `rook-ceph-operator`, `cephcsi-operator`, `odf-prometheus-operator`, `recipe`, `ocs-client-operator`) |
+| **Namespace / scope** | `openshift-storage` / single namespace (namespace label `openshift.io/cluster-monitoring: "true"` required) |
+| **Channel** | `stable-4.22` |
+| **Primary CRs** | `StorageSystem`, `StorageCluster`, `ObjectBucketClaim` |
+| **Alternative** | Vendor CSI (NetApp Trident, Portworx, Dell PowerFlex/PowerStore) when an external array exists — install from the certified catalog and skip LSO/ODF. |
+
+Configuration (after LSO PVs exist on ≥3 nodes):
+```yaml
+apiVersion: ocs.openshift.io/v1
+kind: StorageCluster
+metadata: {name: ocs-storagecluster, namespace: openshift-storage}
+spec:
+  manageNodes: false
+  monDataDirHostPath: /var/lib/rook
+  flexibleScaling: true                 # allow uneven disk counts per node
+  resources: {}                         # or set mds/mon/osd requests for predictable sizing
+  encryption:
+    clusterWide: true                   # at-rest OSD encryption (recommended)
+  placement:
+    all:
+      tolerations:
+        - {key: node-role.kubernetes.io/infra, value: reserved, effect: NoSchedule}
+        - {key: node-role.kubernetes.io/infra, value: reserved, effect: NoExecute}
+  storageDeviceSets:
+    - name: ocs-deviceset
+      count: 2                          # disks per node
+      replica: 3
+      portable: false
+      dataPVCTemplate:
+        spec:
+          storageClassName: localblock
+          accessModes: [ReadWriteOnce]
+          volumeMode: Block
+          resources: {requests: {storage: "1"}}
+```
+Post-config:
+```bash
+oc get storagecluster -n openshift-storage        # Phase: Ready
+oc get cephcluster -n openshift-storage           # HEALTH_OK
+oc get sc                                          # ocs-storagecluster-ceph-rbd / -cephfs / openshift-storage.noobaa.io
+oc patch sc ocs-storagecluster-ceph-rbd -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+oc patch sc ocs-storagecluster-ceph-rbd -p '{"allowVolumeExpansion":true}'
+```
+Production notes: minimum 3 storage nodes × 16 vCPU / 64 GB for the ODF pods alone; dedicate SSD/NVMe; monitor `CephClusterWarningState` alert; enable `clusterWide` encryption before data is written (cannot be enabled later).
+
+---
+
+## 2. Logging & Observability
+
+### 2.1 Red Hat OpenShift Logging + Loki Operator
+
+| | |
+|---|---|
+| **Purpose** | Logging operator deploys the **Vector** collector (DaemonSet) and manages log forwarding. Loki Operator deploys **LokiStack**, the horizontally-scalable log store backed by S3. Together they replace the deprecated EFK (Elasticsearch/Fluentd/Kibana). Logs are viewed in the console via the Cluster Observability Operator UI plugin. |
+| **Packages** | `cluster-logging` (ns `openshift-logging`, single namespace) and `loki-operator` (ns `openshift-operators-redhat`, **all namespaces**) |
+| **Channels** | `stable-6.4` (Logging 6.x — check `defaultChannel`) |
+| **Primary CRs** | `LokiStack`, `ClusterLogForwarder` (`observability.openshift.io/v1`), `UIPlugin` (via COO) |
+
+Configuration:
+```yaml
+# 1. S3 bucket from NooBaa
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata: {name: loki-bucket, namespace: openshift-logging}
+spec: {generateBucketName: loki, storageClassName: openshift-storage.noobaa.io}
+```
+```bash
+# 2. Secret for Loki from the OBC
+BUCKET=$(oc get obc loki-bucket -n openshift-logging -o jsonpath='{.spec.bucketName}')
+KEY=$(oc get secret loki-bucket -n openshift-logging -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d)
+SECRET=$(oc get secret loki-bucket -n openshift-logging -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d)
+oc create secret generic logging-loki-s3 -n openshift-logging \
+  --from-literal=bucketnames=$BUCKET --from-literal=endpoint=https://s3.openshift-storage.svc:443 \
+  --from-literal=access_key_id=$KEY --from-literal=access_key_secret=$SECRET --from-literal=region=noobaa
+oc get cm openshift-service-ca.crt -n openshift-logging || \
+  oc create cm openshift-service-ca.crt -n openshift-logging --from-literal=service-ca.crt="$(oc get cm openshift-service-ca.crt -n openshift-config -o jsonpath='{.data.service-ca\.crt}')"
+```
+```yaml
+# 3. LokiStack
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata: {name: logging-loki, namespace: openshift-logging}
+spec:
+  size: 1x.small                          # 1x.medium for >100 nodes
+  storage:
+    schemas: [{version: v13, effectiveDate: "2024-10-01"}]
+    secret: {name: logging-loki-s3, type: s3}
+    tls: {caName: openshift-service-ca.crt}
+  storageClassName: ocs-storagecluster-ceph-rbd
+  tenants: {mode: openshift-logging}
+  limits:
+    global:
+      retention: {days: 30}
+      ingestion: {ingestionRate: 10, ingestionBurstSize: 20}
+  template:
+    compactor:    &p {nodeSelector: {node-role.kubernetes.io/infra: ""}, tolerations: [{key: node-role.kubernetes.io/infra, value: reserved, effect: NoSchedule},{key: node-role.kubernetes.io/infra, value: reserved, effect: NoExecute}]}
+    distributor:  *p
+    gateway:      *p
+    indexGateway: *p
+    ingester:     *p
+    querier:      *p
+    queryFrontend: *p
+    ruler:        *p
+---
+# 4. Collector service account and RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: collector, namespace: openshift-logging}
+```
+```bash
+for r in collect-application-logs collect-infrastructure-logs collect-audit-logs logging-collector-logs-writer; do
+  oc adm policy add-cluster-role-to-user $r -z collector -n openshift-logging; done
+```
+```yaml
+# 5. Forwarder
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata: {name: collector, namespace: openshift-logging}
+spec:
+  serviceAccount: {name: collector}
+  managementState: Managed
+  collector:
+    resources: {limits: {memory: 2Gi}, requests: {cpu: 200m, memory: 512Mi}}
+  outputs:
+    - name: default-lokistack
+      type: lokiStack
+      lokiStack:
+        target: {name: logging-loki, namespace: openshift-logging}
+        authentication: {token: {from: serviceAccount}}
+      tls: {ca: {key: service-ca.crt, configMapName: openshift-service-ca.crt}}
+    - name: corp-siem                     # optional external SIEM
+      type: syslog
+      syslog: {url: "tls://siem.example.com:6514", rfc: RFC5424, facility: local0, severity: informational}
+  pipelines:
+    - name: to-loki
+      inputRefs: [application, infrastructure, audit]
+      outputRefs: [default-lokistack]
+    - name: audit-to-siem
+      inputRefs: [audit]
+      outputRefs: [corp-siem]
+```
+Verify: `oc get lokistack -n openshift-logging`, `oc get ds collector -n openshift-logging`, console → Observe → Logs.
+Production notes: audit logs are **not** collected by default — the pipeline above adds them; size the S3 bucket for `retention × daily volume × 1.3`; set `ingestionRate` to avoid dropping logs.
+
+### 2.2 Cluster Observability Operator (COO), Tempo, OpenTelemetry
+
+| Operator | Package / ns / scope | Channel | Purpose |
+|---|---|---|---|
+| **Cluster Observability Operator** | `cluster-observability-operator` / `openshift-cluster-observability-operator` / all ns | `stable` | Deploys console **UIPlugins** (logging, troubleshooting panel, distributed tracing, monitoring), standalone `MonitoringStack` Prometheus instances for teams, and Perses dashboards. Required to view Loki logs and Tempo traces in the console. |
+| **Red Hat build of OpenTelemetry** | `opentelemetry-product` / `openshift-opentelemetry-operator` / all ns | `stable` | Manages `OpenTelemetryCollector` instances to receive, process, and export traces/metrics/logs from apps (OTLP). Acts as the ingestion gateway for Tempo. |
+| **Tempo Operator (Distributed Tracing)** | `tempo-product` / `openshift-tempo-operator` / all ns | `stable` | Deploys `TempoStack`/`TempoMonolithic` — S3-backed distributed trace store replacing Jaeger. |
+
+Configuration:
+```yaml
+# COO UI plugins
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata: {name: logging}
+spec:
+  type: Logging
+  logging: {lokiStack: {name: logging-loki}, logsLimit: 50, timeout: 30s}
+---
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata: {name: troubleshooting-panel}
+spec: {type: TroubleshootingPanel}
+---
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata: {name: distributed-tracing}
+spec: {type: DistributedTracing}
+---
+# Tempo (needs an OBC + secret like Loki, in ns openshift-tracing)
+apiVersion: tempo.grafana.com/v1alpha1
+kind: TempoStack
+metadata: {name: tracing, namespace: openshift-tracing}
+spec:
+  storageSize: 20Gi
+  storage: {secret: {name: tempo-s3, type: s3}, tls: {enabled: true, caName: openshift-service-ca.crt}}
+  storageClassName: ocs-storagecluster-ceph-rbd
+  retention: {global: {traces: 168h}}
+  tenants:
+    mode: openshift
+    authentication: [{tenantName: prod, tenantId: 1610b0c3-c509-4592-a256-a1871353dbfa}]
+  template:
+    gateway: {enabled: true}
+    queryFrontend: {jaegerQuery: {enabled: true}}
+---
+# OpenTelemetry collector gateway
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata: {name: otel, namespace: openshift-tracing}
+spec:
+  mode: deployment
+  replicas: 2
+  serviceAccount: otel-collector
+  config:
+    receivers:
+      otlp: {protocols: {grpc: {endpoint: 0.0.0.0:4317}, http: {endpoint: 0.0.0.0:4318}}}
+    processors:
+      batch: {}
+      memory_limiter: {check_interval: 1s, limit_percentage: 75}
+    exporters:
+      otlp:
+        endpoint: tempo-tracing-gateway.openshift-tracing.svc:8090
+        tls: {insecure: false, ca_file: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt}
+        auth: {authenticator: bearertokenauth}
+        headers: {X-Scope-OrgID: prod}
+    extensions:
+      bearertokenauth: {filename: /var/run/secrets/kubernetes.io/serviceaccount/token}
+    service:
+      extensions: [bearertokenauth]
+      pipelines:
+        traces: {receivers: [otlp], processors: [memory_limiter, batch], exporters: [otlp]}
+```
+Grant `otel-collector` SA the `tempostack-traces-write` ClusterRole for tenant `prod`.
+Production notes: install Tempo/OTel only if applications emit traces; COO is needed regardless for the logging console view.
+
+---
+
+## 3. Security
+
+### 3.1 Compliance Operator
+
+| | |
+|---|---|
+| **Purpose** | Runs OpenSCAP scans against CIS, NIST 800-53, PCI-DSS, HIPAA, STIG, and E8 profiles for both the cluster API objects (`ocp4-*`) and node OS (`ocp4-*-node`, `rhcos4-*`). Produces `ComplianceCheckResult` objects and `ComplianceRemediation` MachineConfigs that can be applied automatically or reviewed. Required evidence for audits. |
+| **Package** | `compliance-operator` |
+| **Namespace / scope** | `openshift-compliance` / single namespace |
+| **Channel** | `stable` |
+| **Primary CRs** | `ScanSetting`, `ScanSettingBinding`, `TailoredProfile`, `ComplianceSuite` |
+
+Configuration:
+```yaml
+apiVersion: compliance.openshift.io/v1alpha1
+kind: ScanSetting
+metadata: {name: prod-weekly, namespace: openshift-compliance}
+schedule: "0 1 * * 0"                      # weekly, Sunday 01:00
+rawResultStorage:
+  size: 2Gi
+  storageClassName: ocs-storagecluster-ceph-rbd
+  rotation: 5
+  pvAccessModes: [ReadWriteOnce]
+roles: [master, worker, infra]
+autoApplyRemediations: false               # review first in production
+autoUpdateRemediations: false
+---
+apiVersion: compliance.openshift.io/v1alpha1
+kind: ScanSettingBinding
+metadata: {name: cis-prod, namespace: openshift-compliance}
+profiles:
+  - {name: ocp4-cis,      kind: Profile, apiGroup: compliance.openshift.io/v1alpha1}
+  - {name: ocp4-cis-node, kind: Profile, apiGroup: compliance.openshift.io/v1alpha1}
+settingsRef: {name: prod-weekly, kind: ScanSetting, apiGroup: compliance.openshift.io/v1alpha1}
+```
+Operate:
+```bash
+oc get compliancesuite -n openshift-compliance
+oc get compliancecheckresult -n openshift-compliance -l compliance.openshift.io/check-status=FAIL
+oc get complianceremediation -n openshift-compliance
+oc patch complianceremediation <name> -n openshift-compliance --type merge -p '{"spec":{"apply":true}}'  # per remediation
+oc compliance fetch-raw scansettingbindings cis-prod -o /tmp/results   # oc-compliance plugin for ARF reports
+```
+Production notes: use a `TailoredProfile` to disable rules you've formally accepted; node remediations trigger MCP reboots — apply in a maintenance window.
+
+### 3.2 File Integrity Operator
+
+| | |
+|---|---|
+| **Purpose** | Runs AIDE on every node to detect unauthorized changes to files on RHCOS (binaries, configs, kubelet). Produces `FileIntegrityNodeStatus` and fires the `NodeHasIntegrityFailure` alert. Required by CIS/PCI "file integrity monitoring" controls. |
+| **Package** | `file-integrity-operator` |
+| **Namespace / scope** | `openshift-file-integrity` / single namespace |
+| **Channel** | `stable` |
+| **Primary CR** | `FileIntegrity` |
+
+```yaml
+apiVersion: fileintegrity.openshift.io/v1alpha1
+kind: FileIntegrity
+metadata: {name: cluster-fio, namespace: openshift-file-integrity}
+spec:
+  nodeSelector: {}                          # all nodes
+  tolerations:
+    - {operator: Exists}                    # includes masters and infra
+  config:
+    gracePeriod: 900                        # seconds between scans
+    maxBackups: 5
+    initialDelay: 60
+  debug: false
+```
+After every planned MachineConfig change re-initialize the baseline:
+`oc annotate fileintegrity cluster-fio -n openshift-file-integrity file-integrity.openshift.io/re-init=`.
+Verify: `oc get fileintegritynodestatuses -n openshift-file-integrity`.
+
+### 3.3 Security Profiles Operator (SPO)
+
+| | |
+|---|---|
+| **Purpose** | Manages **seccomp** and **SELinux** profiles as Kubernetes CRs and distributes them to nodes, so pods can reference custom restricted profiles instead of `RuntimeDefault`/`unconfined`. Can record profiles from running workloads. Used to harden high-risk workloads beyond Pod Security Admission. |
+| **Package** | `security-profiles-operator` |
+| **Namespace / scope** | `openshift-security-profiles` / all namespaces |
+| **Channel** | `release-alpha-rhel-8` (verify `defaultChannel`) |
+| **Primary CRs** | `SeccompProfile`, `SelinuxProfile`, `ProfileRecording`, `ProfileBinding` |
+
+```yaml
+# Enable SELinux + log enricher
+apiVersion: security-profiles-operator.x-k8s.io/v1alpha1
+kind: SecurityProfilesOperatorDaemon
+metadata: {name: spod, namespace: openshift-security-profiles}
+spec:
+  enableSelinux: true
+  enableLogEnricher: true
+---
+# Example custom seccomp profile for nginx-style web pods
+apiVersion: security-profiles-operator.x-k8s.io/v1beta1
+kind: SeccompProfile
+metadata: {name: web-restricted, namespace: app-team-a}
+spec:
+  defaultAction: SCMP_ACT_ERRNO
+  architectures: [SCMP_ARCH_X86_64]
+  syscalls:
+    - action: SCMP_ACT_ALLOW
+      names: [accept4, bind, listen, read, write, epoll_wait, futex, exit_group, ...]
+```
+Pods reference it with `securityContext.seccompProfile: {type: Localhost, localhostProfile: operator/app-team-a/web-restricted.json}`.
+Production notes: optional for general workloads; mandatory where regulators demand syscall allow-lists. Record profiles in staging with `ProfileRecording`, then promote.
+
+### 3.4 Red Hat Advanced Cluster Security (RHACS / StackRox)
+
+| | |
+|---|---|
+| **Purpose** | Full Kubernetes security platform: image vulnerability scanning (incl. mirrored registry), configuration/CIS checks, network policy visualization, runtime process/network detection, and an **admission controller** to block non-compliant deployments. Central is the hub; SecuredCluster is deployed on every cluster. |
+| **Package** | `rhacs-operator` |
+| **Namespace / scope** | `rhacs-operator` (operator), `stackrox` (Central/SecuredCluster) / all namespaces |
+| **Channel** | `stable` |
+| **Primary CRs** | `Central`, `SecuredCluster` |
+
+```yaml
+apiVersion: platform.stackrox.io/v1alpha1
+kind: Central
+metadata: {name: stackrox-central-services, namespace: stackrox}
+spec:
+  central:
+    exposure: {route: {enabled: true}}
+    db: {persistence: {persistentVolumeClaim: {claimName: central-db, storageClassName: ocs-storagecluster-ceph-rbd, size: 100Gi}}}
+    resources: {requests: {cpu: "2", memory: 8Gi}, limits: {cpu: "4", memory: 16Gi}}
+    nodeSelector: {node-role.kubernetes.io/infra: ""}
+    tolerations:
+      - {key: node-role.kubernetes.io/infra, value: reserved, effect: NoSchedule}
+      - {key: node-role.kubernetes.io/infra, value: reserved, effect: NoExecute}
+  scanner:
+    analyzer: {scaling: {autoScaling: Enabled, min: 2, max: 5}}
+  scannerV4: {scannerComponent: Enabled}
+  egress: {connectivityPolicy: Offline}         # disconnected: upload vuln DB manually
+```
+```bash
+# Get admin password, create init bundle, then:
+oc -n stackrox get secret central-htpasswd -o jsonpath='{.data.password}' | base64 -d
+roxctl -e "$(oc get route central -n stackrox -o jsonpath='{.spec.host}'):443" central init-bundles generate prod --output-secrets bundle.yaml
+oc apply -f bundle.yaml -n stackrox
+```
+```yaml
+apiVersion: platform.stackrox.io/v1alpha1
+kind: SecuredCluster
+metadata: {name: stackrox-secured-cluster-services, namespace: stackrox}
+spec:
+  clusterName: ocp-prod
+  centralEndpoint: central.stackrox.svc:443
+  admissionControl:
+    listenOnCreates: true
+    listenOnUpdates: true
+    listenOnEvents: true
+    enforceOnCreates: true          # set false during initial baseline period
+    enforceOnUpdates: true
+    timeoutSeconds: 20
+  perNode:
+    collector: {collection: CORE_BPF}
+  scanner: {scannerComponent: AutoSense}
+```
+Production notes: in disconnected mode, download the vulnerability definitions bundle on the connected host (`roxctl scanner download-db`) and upload to Central on a schedule; integrate Central with the mirror registry credentials so images are scanned; export violations to the SIEM via a notifier.
+
+---
+
+## 4. Certificates & Secrets
+
+### 4.1 cert-manager Operator for Red Hat OpenShift
+
+| | |
+|---|---|
+| **Purpose** | Automates issuance and renewal of TLS certificates from ACME (Let's Encrypt — connected only), Venafi, Vault PKI, or an internal CA. Issues `Certificate` objects into secrets consumed by Routes/Ingress and workloads. Removes manual certificate rotation for app-level TLS. |
+| **Package** | `openshift-cert-manager-operator` |
+| **Namespace / scope** | `cert-manager-operator` (operator), `cert-manager` (controllers) / single namespace |
+| **Channel** | `stable-v1` |
+| **Primary CRs** | `ClusterIssuer`, `Issuer`, `Certificate` |
+
+```yaml
+# Internal CA issuer from an enterprise intermediate CA (disconnected-friendly)
+apiVersion: v1
+kind: Secret
+metadata: {name: corp-intermediate-ca, namespace: cert-manager}
+type: kubernetes.io/tls
+data: {tls.crt: <base64 intermediate cert>, tls.key: <base64 key>}
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: {name: corp-ca}
+spec:
+  ca: {secretName: corp-intermediate-ca}
+---
+# Vault PKI alternative
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: {name: vault-pki}
+spec:
+  vault:
+    server: https://vault.example.com:8200
+    path: pki_int/sign/ocp-prod
+    caBundle: <base64 vault CA>
+    auth:
+      kubernetes:
+        role: cert-manager
+        mountPath: /v1/auth/kubernetes
+        serviceAccountRef: {name: cert-manager}
+---
+# Example certificate
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: api-gateway-tls, namespace: app-team-a}
+spec:
+  secretName: api-gateway-tls
+  duration: 2160h
+  renewBefore: 360h
+  dnsNames: [api-gateway.apps.ocp-prod.example.com]
+  issuerRef: {name: corp-ca, kind: ClusterIssuer}
+```
+Production notes: pair with the **cert-manager Operator's** `CertManager` CR to pin controller resources and enable `--enable-certificate-owner-ref`; use it also to rotate the wildcard ingress certificate automatically (`Certificate` in `openshift-ingress` + patch IngressController).
+
+### 4.2 External Secrets Operator (ESO) / Vault CSI
+
+| | |
+|---|---|
+| **Purpose** | Syncs secrets from an external vault (HashiCorp Vault, AWS Secrets Manager, Azure Key Vault, CyberArk) into Kubernetes `Secret` objects on a schedule, so secrets are never committed to Git and are rotated centrally. **Vault CSI / Secrets Store CSI** mounts secrets as files at pod start instead of creating Secret objects. |
+| **Packages** | `external-secrets-operator` (Red Hat build — `redhat-operators`, GA in 4.22; or community `external-secrets-operator` from certified/community catalog); `secrets-store-csi-driver-operator` for CSI |
+| **Namespace / scope** | `external-secrets-operator` / all namespaces |
+| **Channel** | `stable-v1` / `tech-preview-v0.1` (verify) |
+| **Primary CRs** | `ExternalSecretsConfig` (Red Hat operand), `ClusterSecretStore`, `SecretStore`, `ExternalSecret` |
+
+```yaml
+# Red Hat build: deploy the operand
+apiVersion: operator.openshift.io/v1alpha1
+kind: ExternalSecretsConfig
+metadata: {name: cluster}
+spec: {}
+---
+# Vault backend with Kubernetes auth
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata: {name: vault-prod}
+spec:
+  provider:
+    vault:
+      server: https://vault.example.com:8200
+      path: kv
+      version: v2
+      caBundle: <base64 vault CA>
+      auth:
+        kubernetes:
+          mountPath: kubernetes
+          role: ocp-prod-eso
+          serviceAccountRef: {name: eso-vault-auth, namespace: external-secrets}
+---
+# Sync a secret into an app namespace
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata: {name: db-credentials, namespace: app-team-a}
+spec:
+  refreshInterval: 1h
+  secretStoreRef: {name: vault-prod, kind: ClusterSecretStore}
+  target: {name: db-credentials, creationPolicy: Owner}
+  data:
+    - secretKey: username
+      remoteRef: {key: app-team-a/db, property: username}
+    - secretKey: password
+      remoteRef: {key: app-team-a/db, property: password}
+```
+Production notes: restrict which namespaces may use the `ClusterSecretStore` via `conditions.namespaceSelector`; use one Vault role per namespace/team; combine with etcd encryption (secrets still land in etcd).
+
+---
+
+## 5. GitOps & CI/CD
+
+### 5.1 OpenShift GitOps (Argo CD)
+
+| | |
+|---|---|
+| **Purpose** | Declarative, Git-driven management of cluster configuration and applications. The default `openshift-gitops` Argo CD instance is intended for **cluster config** (operators, RBAC, quotas, policies); teams get their own Argo CD instances for apps. Provides drift detection, sync waves, and audit history for every change. |
+| **Package** | `openshift-gitops-operator` |
+| **Namespace / scope** | `openshift-gitops-operator` / all namespaces |
+| **Channel** | `latest` or `gitops-1.18` (pin to a specific channel in prod) |
+| **Primary CRs** | `ArgoCD`, `Application`, `ApplicationSet`, `AppProject` |
+
+```yaml
+# Harden the default cluster-config instance
+apiVersion: argoproj.io/v1beta1
+kind: ArgoCD
+metadata: {name: openshift-gitops, namespace: openshift-gitops}
+spec:
+  server:
+    route: {enabled: true, tls: {termination: reencrypt}}
+    autoscale: {enabled: true}
+  sso:
+    provider: dex
+    dex: {openShiftOAuth: true}
+  rbac:
+    defaultPolicy: role:readonly
+    policy: |
+      g, ocp-cluster-admins, role:admin
+      g, ocp-platform-team, role:admin
+    scopes: "[groups]"
+  controller:
+    resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: "2", memory: 4Gi}}
+  repo:
+    resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: "1", memory: 1Gi}}
+  resourceHealthChecks: []
+  nodePlacement:
+    nodeSelector: {node-role.kubernetes.io/infra: ""}
+    tolerations:
+      - {key: node-role.kubernetes.io/infra, value: reserved, effect: NoSchedule}
+      - {key: node-role.kubernetes.io/infra, value: reserved, effect: NoExecute}
+---
+# Cluster-config app-of-apps
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata: {name: cluster-config, namespace: openshift-gitops}
+spec:
+  project: default
+  source:
+    repoURL: https://git.example.com/platform/ocp-prod-config.git
+    targetRevision: main
+    path: clusters/ocp-prod
+  destination: {server: https://kubernetes.default.svc}
+  syncPolicy:
+    automated: {prune: false, selfHeal: true}
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]
+```
+```bash
+oc adm policy add-cluster-role-to-user cluster-admin -z openshift-gitops-argocd-application-controller -n openshift-gitops
+oc create secret generic git-creds -n openshift-gitops --from-literal=url=https://git.example.com --from-literal=username=svc-argocd --from-literal=password=<token>
+oc label secret git-creds -n openshift-gitops argocd.argoproj.io/secret-type=repo-creds
+```
+Production notes: disable the default `openshift-gitops` instance (`DISABLE_DEFAULT_ARGOCD_INSTANCE=true` env on the Subscription) if you manage Argo CD yourself; store the Git CA in `argocd-tls-certs-cm`; never use `prune: true` on cluster-config until well tested.
+
+### 5.2 OpenShift Pipelines (Tekton)
+
+| | |
+|---|---|
+| **Purpose** | Kubernetes-native CI: `Task`/`Pipeline`/`PipelineRun` CRs executed as pods, with Tekton Triggers for Git webhooks, Tekton Chains for supply-chain signing/attestation (SLSA), Tekton Results for history, and a console UI. Install only if you don't use external CI (Jenkins/GitLab CI/GitHub Actions). |
+| **Package** | `openshift-pipelines-operator-rh` |
+| **Namespace / scope** | `openshift-operators` / all namespaces |
+| **Channel** | `latest` or `pipelines-1.20` (pin in prod) |
+| **Primary CRs** | `TektonConfig`, `TektonChain`, `TektonResult` |
+
+```yaml
+apiVersion: operator.tekton.dev/v1alpha1
+kind: TektonConfig
+metadata: {name: config}
+spec:
+  profile: all
+  targetNamespace: openshift-pipelines
+  pruner:
+    resources: [pipelinerun, taskrun]
+    keep: 50
+    schedule: "0 3 * * *"
+  pipeline:
+    default-service-account: pipeline
+    enable-api-fields: stable
+    disable-affinity-assistant: false
+    default-timeout-minutes: 60
+    performance: {buckets: 3, replicas: 2}
+  chain:
+    disabled: false
+    artifacts.oci.storage: oci
+    artifacts.pipelinerun.format: in-toto
+    transparency.enabled: "false"        # disconnected: no public Rekor
+  trigger:
+    default-service-account: pipeline
+  hub:
+    params: [{name: enable-devconsole-integration, value: "false"}]   # disconnected
+  platforms:
+    openshift: {pipelinesAsCode: {enable: true, settings: {}}}
+```
+```bash
+# Point ClusterTasks / resolvers at the mirror registry images
+oc patch tektonconfig config --type merge -p '{"spec":{"pipeline":{"default-resolver-type":"bundles"}}}'
+```
+Production notes: set a `ResourceQuota` in `openshift-pipelines`; use `pipelinesAsCode` with your Git server; mirror the Tekton Hub task bundle images (`registry.redhat.io/openshift-pipelines/*`) in the ImageSetConfiguration `additionalImages`.
+
+---
+
+## 6. Networking
+
+### 6.1 MetalLB
+
+| | |
+|---|---|
+| **Purpose** | Provides `Service type=LoadBalancer` on bare metal by announcing service IPs via Layer 2 (ARP/NDP) or BGP. Needed for non-HTTP workloads (databases, Kafka, gRPC) that cannot use the OpenShift router. |
+| **Package** | `metallb-operator` |
+| **Namespace / scope** | `metallb-system` / single namespace |
+| **Channel** | `stable` |
+| **Primary CRs** | `MetalLB`, `IPAddressPool`, `L2Advertisement`, `BGPPeer`, `BGPAdvertisement` |
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: MetalLB
+metadata: {name: metallb, namespace: metallb-system}
+spec:
+  nodeSelector: {node-role.kubernetes.io/worker: ""}    # speakers on workers only
+  logLevel: info
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata: {name: prod-l2, namespace: metallb-system}
+spec:
+  addresses: [192.168.100.200-192.168.100.230]
+  autoAssign: false                                      # require explicit annotation
+  avoidBuggyIPs: true
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata: {name: prod-l2, namespace: metallb-system}
+spec:
+  ipAddressPools: [prod-l2]
+  nodeSelectors: [{matchLabels: {node-role.kubernetes.io/worker: ""}}]
+---
+# BGP variant (preferred for multi-rack / ECMP)
+apiVersion: metallb.io/v1beta2
+kind: BGPPeer
+metadata: {name: tor-a, namespace: metallb-system}
+spec: {myASN: 64512, peerASN: 64500, peerAddress: 192.168.100.1, holdTime: 90s, keepaliveTime: 30s, bfdProfile: default}
+```
+Request an IP: `metallb.universe.tf/address-pool: prod-l2` annotation on the Service.
+Production notes: coordinate the pool with the network team (excluded from DHCP); use BGP with BFD where the switches support it — L2 fails over slower and pins all traffic to one node.
+
+### 6.2 Kubernetes NMState Operator
+
+| | |
+|---|---|
+| **Purpose** | Declaratively manages host networking on RHCOS nodes after installation — bonds, VLANs, bridges, additional interfaces, routes, DNS — via `NodeNetworkConfigurationPolicy`. Required to create bridges for OpenShift Virtualization, VLAN interfaces for Multus/SR-IOV, or secondary storage networks. |
+| **Package** | `kubernetes-nmstate-operator` |
+| **Namespace / scope** | `openshift-nmstate` / single namespace |
+| **Channel** | `stable` |
+| **Primary CRs** | `NMState` (singleton), `NodeNetworkConfigurationPolicy`, `NodeNetworkState` (read-only) |
+
+```yaml
+apiVersion: nmstate.io/v1
+kind: NMState
+metadata: {name: nmstate}
+---
+# Example: VLAN 300 + bridge on the worker bond for storage/VM traffic
+apiVersion: nmstate.io/v1
+kind: NodeNetworkConfigurationPolicy
+metadata: {name: br-storage-vlan300}
+spec:
+  nodeSelector: {node-role.kubernetes.io/worker: ""}
+  maxUnavailable: 1
+  desiredState:
+    interfaces:
+      - name: bond0.300
+        type: vlan
+        state: up
+        vlan: {base-iface: bond0, id: 300}
+      - name: br-storage
+        type: linux-bridge
+        state: up
+        ipv4: {enabled: false}
+        bridge:
+          options: {stp: {enabled: false}}
+          port: [{name: bond0.300}]
+```
+Verify: `oc get nnce` (enactments), `oc get nns <node> -o yaml`.
+Production notes: always set `maxUnavailable`; test on one node with a tight `nodeSelector` first; a bad policy can isolate a node — NMState rolls back if the API server becomes unreachable, but not for data-plane-only breakage.
+
+### 6.3 SR-IOV Network Operator & Multus (advanced / telco)
+
+| | |
+|---|---|
+| **Multus** | Built into OCP (Cluster Network Operator). Lets pods attach **additional** network interfaces via `NetworkAttachmentDefinition` (macvlan, ipvlan, bridge, host-device, SR-IOV). No install needed — just create NADs. |
+| **SR-IOV Network Operator** | Package `sriov-network-operator`, ns `openshift-sriov-network-operator`, single ns, channel `stable`. Configures SR-IOV Virtual Functions on supported NICs (Intel E810/X710, Mellanox ConnectX) and exposes them as device-plugin resources for DPDK/high-throughput/low-latency pods. Only for NFV, HPC, or line-rate workloads. |
+
+```yaml
+# Multus macvlan attachment (no operator)
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata: {name: storage-net, namespace: app-team-a}
+spec:
+  config: '{"cniVersion":"0.3.1","type":"macvlan","master":"bond0.300","mode":"bridge",
+            "ipam":{"type":"whereabouts","range":"10.30.0.0/24","range_start":"10.30.0.50","range_end":"10.30.0.200"}}'
+---
+# SR-IOV
+apiVersion: sriovnetwork.openshift.io/v1
+kind: SriovNetworkNodePolicy
+metadata: {name: e810-vfs, namespace: openshift-sriov-network-operator}
+spec:
+  resourceName: intel_e810
+  nodeSelector: {feature.node.kubernetes.io/network-sriov.capable: "true"}
+  numVfs: 16
+  nicSelector: {vendor: "8086", deviceID: "1593", pfNames: ["ens2f0"]}
+  deviceType: vfio-pci              # or netdevice
+  isRdma: false
+---
+apiVersion: sriovnetwork.openshift.io/v1
+kind: SriovNetwork
+metadata: {name: sriov-dpdk, namespace: openshift-sriov-network-operator}
+spec:
+  resourceName: intel_e810
+  networkNamespace: telco-app
+  vlan: 400
+  ipam: '{"type":"static"}'
+```
+Pods request `resources.limits: {openshift.io/intel_e810: 1}` and annotate `k8s.v1.cni.cncf.io/networks: sriov-dpdk`.
+Production notes: SR-IOV node policy application reboots nodes; pair with NFD labels and the Performance Profile (Section 11).
+
+---
